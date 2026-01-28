@@ -57,6 +57,17 @@ def get_gpu_info():
         return gpu_name, total_mem
     return "CPU", 0
 
+def get_machine_info():
+    """Get machine/pod info from environment"""
+    return {
+        "pod_id": os.environ.get("RUNPOD_POD_ID", "unknown"),
+        "gpu_count": os.environ.get("RUNPOD_GPU_COUNT", "1"),
+        "cpu_count": os.environ.get("RUNPOD_CPU_COUNT", "unknown"),
+        "mem_gb": os.environ.get("RUNPOD_MEM_GB", "unknown"),
+        "volume_id": os.environ.get("RUNPOD_VOLUME_ID", "none"),
+        "dc_id": os.environ.get("RUNPOD_DC_ID", "unknown"),
+    }
+
 def get_gpu_cost_per_hour(gpu_name):
     """Get estimated cost per hour for the GPU"""
     for key, price in GPU_PRICING.items():
@@ -75,6 +86,13 @@ def load_models():
     print("=" * 60)
     print("🚀 SEEDVC V2 SERVER STARTING")
     print("=" * 60)
+    
+    # Get machine info
+    machine = get_machine_info()
+    print(f"🖥️  Pod ID: {machine['pod_id']}")
+    print(f"🌐 Datacenter: {machine['dc_id']}")
+    print(f"💻 CPUs: {machine['cpu_count']}, RAM: {machine['mem_gb']}GB")
+    print("-" * 60)
     
     sys.path.insert(0, "/workspace/seed-vc")
     os.chdir("/workspace/seed-vc")
@@ -121,6 +139,7 @@ async def health():
     """Health check endpoint with detailed info"""
     gpu_info = get_gpu_info()
     gpu_cost = get_gpu_cost_per_hour(gpu_info[0]) if gpu_info[0] != "CPU" else 0
+    machine = get_machine_info()
     
     return {
         "status": "healthy",
@@ -131,6 +150,7 @@ async def health():
         "cost_per_hour": gpu_cost,
         "model_load_time_s": round(model_load_time, 2) if model_load_time else None,
         "gpu_memory_used_gb": round(torch.cuda.memory_allocated(0) / (1024**3), 2) if torch.cuda.is_available() else 0,
+        "machine": machine,
     }
 
 @app.post("/convert")
@@ -152,9 +172,13 @@ async def convert_voice_endpoint(
         gpu_info = get_gpu_info()
         gpu_cost_per_hour = get_gpu_cost_per_hour(gpu_info[0])
         
+        # Get machine info
+        machine = get_machine_info()
+        
         print("=" * 60)
         print("🎤 VOICE CONVERSION REQUEST")
         print("=" * 60)
+        print(f"🖥️  Pod: {machine['pod_id']} | DC: {machine['dc_id']}")
         print(f"📊 GPU: {gpu_info[0]}")
         print(f"💰 Cost rate: ${gpu_cost_per_hour:.2f}/hour")
         print(f"⚙️  Diffusion steps: {diffusion_steps}")
