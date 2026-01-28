@@ -1,39 +1,50 @@
 """
-RunPod Serverless Handler for SeedVC V2 Voice Conversion
+RunPod Load Balancing FastAPI Server for SeedVC V2 Voice Conversion
 Matches the Vast.ai always-on instance configuration
 """
-import runpod
 import os
 import sys
 import base64
 import tempfile
 import torch
 import torchaudio
-import requests
+import requests as http_requests
 import yaml
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
-# Global model variables - loaded once on cold start
+# Global model variables - loaded once on startup
 vc_wrapper_v2 = None
 device = None
 dtype = torch.float16
 
+app = FastAPI(title="SeedVC V2 API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 def load_models():
-    """Load SeedVC V2 models on cold start"""
+    """Load SeedVC V2 models on startup"""
     global vc_wrapper_v2, device, dtype
     
     if vc_wrapper_v2 is not None:
-        return  # Already loaded
+        return
     
     print("Loading SeedVC V2 models...")
     
-    # Add seed-vc to path
     sys.path.insert(0, "/workspace/seed-vc")
     os.chdir("/workspace/seed-vc")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Load V2 model using hydra config (same as Vast.ai instance)
     from hydra.utils import instantiate
     from omegaconf import DictConfig
     
@@ -46,149 +57,96 @@ def load_models():
     
     print("SeedVC V2 models loaded successfully!")
 
-def convert_voice(source_path, target_path, diffusion_steps=30, length_adjust=1.0, convert_style=True):
-    """Convert voice using V2 model"""
-    global vc_wrapper_v2, device, dtype
-    
-    os.chdir("/workspace/seed-vc")
-    
-    print(f"Converting: {source_path} -> {target_path}")
-    
-    # Use stream_output=True and collect the LAST yielded result
-    full_audio = None
-    for mp3_bytes, audio_result in vc_wrapper_v2.convert_voice_with_streaming(
-        source_audio_path=source_path,
-        target_audio_path=target_path,
-        diffusion_steps=min(diffusion_steps, 50),
-        length_adjust=length_adjust,
-        intelligebility_cfg_rate=0.7,
-        similarity_cfg_rate=0.7,
-        top_p=0.7,
-        temperature=0.7,
-        repetition_penalty=1.5,
-        convert_style=convert_style,
-        anonymization_only=False,
-        device=device,
-        dtype=dtype,
-        stream_output=True,
-    ):
-        full_audio = audio_result
-    
-    if full_audio is None:
-        raise Exception("Conversion returned no audio")
-    
-    return full_audio
+@app.on_event("startup")
+async def startup_event():
+    load_models()
 
-def handler(event):
-    """
-    RunPod handler for SeedVC V2 voice conversion
+@app.get("/ping")
+async def ping():
+    """Health check endpoint for RunPod Load Balancing"""
+    return {"status": "healthy"}
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {"status": "healthy", "models_loaded": vc_wrapper_v2 is not None, "device": str(device)}
+
+@app.post("/convert")
+async def convert_voice_endpoint(
+    source_audio: UploadFile = File(...),
+    target_audio: UploadFile = File(...),
+    diffusion_steps: int = Form(30),
+    length_adjust: float = Form(1.0),
+    convert_style: bool = Form(True),
+):
+    """Convert voice from source to target voice"""
+    if vc_wrapper_v2 is None:
+        raise HTTPException(status_code=503, detail="Models not loaded")
     
-    Input format:
-    {
-        "input": {
-            "source_audio": "<base64 encoded audio or URL>",
-            "target_audio": "<base64 encoded audio or URL>",
-            "source_is_url": true/false,
-            "target_is_url": true/false,
-            "diffusion_steps": 30,
-            "length_adjust": 1.0,
-            "convert_style": true
-        }
-    }
-    
-    Output format:
-    {
-        "audio_base64": "<base64 encoded converted audio>",
-        "duration": <float>
-    }
-    """
     try:
-        # Load models on first request
-        load_models()
+        src_path = tempfile.mktemp(suffix=".wav")
+        tgt_path = tempfile.mktemp(suffix=".wav")
         
-        input_data = event.get("input", {})
+        with open(src_path, "wb") as f:
+            f.write(await source_audio.read())
+        with open(tgt_path, "wb") as f:
+            f.write(await target_audio.read())
         
-        source_audio = input_data.get("source_audio")
-        target_audio = input_data.get("target_audio")
-        source_is_url = input_data.get("source_is_url", False)
-        target_is_url = input_data.get("target_is_url", False)
-        diffusion_steps = input_data.get("diffusion_steps", 30)
-        length_adjust = input_data.get("length_adjust", 1.0)
-        convert_style = input_data.get("convert_style", True)
+        print(f"Converting: {src_path} -> {tgt_path}")
         
-        if not source_audio or not target_audio:
-            return {"error": "Missing source_audio or target_audio"}
+        os.chdir("/workspace/seed-vc")
         
-        # Create temp files
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source_path = os.path.join(tmpdir, "source.wav")
-            target_path = os.path.join(tmpdir, "target.wav")
-            output_path = os.path.join(tmpdir, "output.wav")
-            
-            # Download or decode source audio
-            if source_is_url:
-                response = requests.get(source_audio)
-                with open(source_path, "wb") as f:
-                    f.write(response.content)
-            else:
-                with open(source_path, "wb") as f:
-                    f.write(base64.b64decode(source_audio))
-            
-            # Download or decode target audio
-            if target_is_url:
-                response = requests.get(target_audio)
-                with open(target_path, "wb") as f:
-                    f.write(response.content)
-            else:
-                with open(target_path, "wb") as f:
-                    f.write(base64.b64decode(target_audio))
-            
-            # Convert voice using V2
-            print(f"Converting voice with V2...")
-            audio_result = convert_voice(
-                source_path, 
-                target_path, 
-                diffusion_steps=diffusion_steps,
-                length_adjust=length_adjust,
-                convert_style=convert_style
-            )
-            
-            # Save audio result to file
-            # audio_result is a tuple (sample_rate, audio_array)
-            sample_rate, audio_array = audio_result
-            
-            # Convert to tensor and save
-            import numpy as np
-            if isinstance(audio_array, np.ndarray):
-                audio_tensor = torch.from_numpy(audio_array).float()
-            else:
-                audio_tensor = audio_array
-            
-            if audio_tensor.dim() == 1:
-                audio_tensor = audio_tensor.unsqueeze(0)
-            
-            torchaudio.save(output_path, audio_tensor, sample_rate)
-            
-            # Read output and encode to base64
-            with open(output_path, "rb") as f:
-                output_bytes = f.read()
-            
-            output_base64 = base64.b64encode(output_bytes).decode("utf-8")
-            
-            # Calculate duration
-            duration = audio_tensor.shape[1] / sample_rate
-            
-            return {
-                "audio_base64": output_base64,
-                "duration": duration
-            }
-            
+        full_audio = None
+        for mp3_bytes, audio_result in vc_wrapper_v2.convert_voice_with_streaming(
+            source_audio_path=src_path,
+            target_audio_path=tgt_path,
+            diffusion_steps=min(diffusion_steps, 50),
+            length_adjust=length_adjust,
+            intelligebility_cfg_rate=0.7,
+            similarity_cfg_rate=0.7,
+            top_p=0.7,
+            temperature=0.7,
+            repetition_penalty=1.5,
+            convert_style=convert_style,
+            anonymization_only=False,
+            device=device,
+            dtype=dtype,
+            stream_output=True,
+        ):
+            full_audio = audio_result
+        
+        if full_audio is None:
+            raise HTTPException(status_code=500, detail="Conversion returned no audio")
+        
+        sample_rate, audio_array = full_audio
+        
+        import numpy as np
+        if isinstance(audio_array, np.ndarray):
+            audio_tensor = torch.from_numpy(audio_array).float()
+        else:
+            audio_tensor = audio_array
+        
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+        
+        output_path = tempfile.mktemp(suffix=".wav")
+        torchaudio.save(output_path, audio_tensor, sample_rate)
+        
+        # Clean up input files
+        os.remove(src_path)
+        os.remove(tgt_path)
+        
+        return FileResponse(
+            output_path,
+            media_type="audio/wav",
+            filename="converted.wav",
+            background=None
+        )
+        
     except Exception as e:
         import traceback
-        return {
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
 
 if __name__ == "__main__":
-    runpod.serverless.start({"handler": handler})
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

@@ -24,8 +24,8 @@ WORKDIR /workspace/seed-vc
 RUN grep -v "^torch" requirements.txt | grep -v "^#" | grep -v "^$" > requirements_filtered.txt || true
 RUN pip install --no-cache-dir -r requirements_filtered.txt || true
 
-# Install additional required packages
-RUN pip install --no-cache-dir runpod requests
+# Install additional required packages for FastAPI server
+RUN pip install --no-cache-dir fastapi uvicorn python-multipart requests
 
 # Copy handler
 COPY handler.py /workspace/handler.py
