@@ -1,12 +1,16 @@
 """
-SeedVC V2 Voice Conversion Worker
+SeedVC Voice Conversion Worker (V1 + V2)
 Compatible with WaveSpeed (Waverless) and RunPod Serverless
 
-Modes:
+Voice Modes:
+- V1 (Fast): Ultra-fast, preserves original timing/pitch - ideal for lip-sync
+- V2 (Quality): Slightly slower, emphasizes target voice - better voice quality
+
+Server Modes:
 - QUEUE MODE (default): For WaveSpeed/RunPod serverless queue-based endpoints
 - LOAD_BALANCER MODE: For RunPod Load Balancing HTTP endpoints (commented out below)
 
-To switch modes, comment/uncomment the appropriate sections at the bottom of this file.
+To switch server modes, comment/uncomment the appropriate sections at the bottom of this file.
 """
 import os
 import sys
@@ -21,7 +25,8 @@ import io
 import runpod
 
 # Global model variables - loaded once on startup
-vc_wrapper_v2 = None
+vc_wrapper_v1 = None  # V1: Voice & Singing - Fast, preserves timing
+vc_wrapper_v2 = None  # V2: Voice & Style - Quality, emphasizes target voice
 device = None
 dtype = torch.float16
 model_load_time = None
@@ -73,15 +78,15 @@ def get_gpu_cost_per_hour(gpu_name):
     return GPU_PRICING["default"]
 
 def load_models():
-    """Load SeedVC V2 models on startup"""
-    global vc_wrapper_v2, device, dtype, model_load_time
+    """Load both SeedVC V1 and V2 models on startup"""
+    global vc_wrapper_v1, vc_wrapper_v2, device, dtype, model_load_time
     
-    if vc_wrapper_v2 is not None:
+    if vc_wrapper_v1 is not None and vc_wrapper_v2 is not None:
         return
     
     load_start = time.time()
     print("=" * 60)
-    print("🚀 SEEDVC V2 WORKER STARTING")
+    print("🚀 SEEDVC V1+V2 WORKER STARTING")
     print("=" * 60)
     
     # Get machine info
@@ -103,29 +108,49 @@ def load_models():
     print(f"💰 Estimated cost: ${gpu_cost:.2f}/hour")
     print("-" * 60)
     
-    print("📦 Loading SeedVC V2 models...")
-    
     from hydra.utils import instantiate
     from omegaconf import DictConfig
     
-    cfg = DictConfig(yaml.safe_load(open("configs/v2/vc_wrapper.yaml", "r")))
-    vc_wrapper_v2 = instantiate(cfg)
+    # Load V1 models (Fast - Voice & Singing)
+    print("📦 Loading SeedVC V1 models (Fast mode)...")
+    cfg_v1 = DictConfig(yaml.safe_load(open("configs/v1/vc_wrapper.yaml", "r")))
+    vc_wrapper_v1 = instantiate(cfg_v1)
+    vc_wrapper_v1.load_checkpoints()
+    vc_wrapper_v1.to(device)
+    vc_wrapper_v1.eval()
+    print(f"✅ V1 loaded | GPU Memory: {torch.cuda.memory_allocated(0) / (1024**3):.2f} GB")
+    
+    # Load V2 models (Quality - Voice & Style)
+    print("📦 Loading SeedVC V2 models (Quality mode)...")
+    cfg_v2 = DictConfig(yaml.safe_load(open("configs/v2/vc_wrapper.yaml", "r")))
+    vc_wrapper_v2 = instantiate(cfg_v2)
     vc_wrapper_v2.load_checkpoints()
     vc_wrapper_v2.to(device)
     vc_wrapper_v2.eval()
     vc_wrapper_v2.setup_ar_caches(max_batch_size=1, max_seq_len=4096, dtype=dtype, device=device)
+    print(f"✅ V2 loaded | GPU Memory: {torch.cuda.memory_allocated(0) / (1024**3):.2f} GB")
     
     model_load_time = time.time() - load_start
     
     print("-" * 60)
-    print(f"✅ Models loaded in {model_load_time:.2f}s")
-    print(f"💾 GPU Memory used: {torch.cuda.memory_allocated(0) / (1024**3):.2f} GB")
+    print(f"✅ All models loaded in {model_load_time:.2f}s")
+    print(f"💾 Total GPU Memory used: {torch.cuda.memory_allocated(0) / (1024**3):.2f} GB")
     print("=" * 60)
 
 
-def convert_voice(source_audio_bytes, target_audio_bytes, diffusion_steps=30, length_adjust=1.0, convert_style=True):
+def convert_voice(source_audio_bytes, target_audio_bytes, mode="fast", diffusion_steps=None, length_adjust=1.0,
+                  # V1 parameters (for testing - will be hardcoded in production)
+                  inference_cfg_rate=0.7, auto_f0_adjust=True, pitch_shift=0,
+                  # V2 parameters (for testing - will be hardcoded in production)
+                  intelligibility_cfg_rate=0.5, similarity_cfg_rate=0.5, 
+                  top_p=0.9, temperature=1.0, repetition_penalty=1.0, convert_style=False):
     """
-    Core voice conversion function used by both queue and HTTP modes.
+    Core voice conversion function supporting both V1 (fast) and V2 (quality) modes.
+    
+    Modes:
+    - "fast" (V1): Ultra-fast, preserves timing/pitch - ideal for lip-sync
+    - "quality" (V2): Slightly slower, emphasizes target voice - better quality
+    
     Returns: (audio_base64, sample_rate, duration, metrics)
     """
     import numpy as np
@@ -137,15 +162,34 @@ def convert_voice(source_audio_bytes, target_audio_bytes, diffusion_steps=30, le
     gpu_cost_per_hour = get_gpu_cost_per_hour(gpu_info[0])
     machine = get_machine_info()
     
+    # Determine mode and set default diffusion steps
+    is_v1 = mode.lower() in ["fast", "v1", "lipsync"]
+    mode_name = "V1 (Fast/Lip-sync)" if is_v1 else "V2 (Quality)"
+    
+    # Default diffusion steps based on mode
+    if diffusion_steps is None:
+        diffusion_steps = 10 if is_v1 else 40
+    
     print("=" * 60)
-    print("🎤 VOICE CONVERSION REQUEST")
+    print(f"🎤 VOICE CONVERSION REQUEST - {mode_name}")
     print("=" * 60)
     print(f"🖥️  Pod: {machine['pod_id']} | DC: {machine['dc_id']}")
     print(f"📊 GPU: {gpu_info[0]}")
     print(f"💰 Cost rate: ${gpu_cost_per_hour:.2f}/hour")
+    print(f"🔧 Mode: {mode_name}")
     print(f"⚙️  Diffusion steps: {diffusion_steps}")
     print(f"⚙️  Length adjust: {length_adjust}")
-    print(f"⚙️  Convert style: {convert_style}")
+    if is_v1:
+        print(f"⚙️  Inference CFG rate: {inference_cfg_rate}")
+        print(f"⚙️  Auto F0 adjust: {auto_f0_adjust}")
+        print(f"⚙️  Pitch shift: {pitch_shift}")
+    else:
+        print(f"⚙️  Intelligibility CFG: {intelligibility_cfg_rate}")
+        print(f"⚙️  Similarity CFG: {similarity_cfg_rate}")
+        print(f"⚙️  Top-p: {top_p}")
+        print(f"⚙️  Temperature: {temperature}")
+        print(f"⚙️  Repetition penalty: {repetition_penalty}")
+        print(f"⚙️  Convert style: {convert_style}")
     print("-" * 60)
     
     # Save input files
@@ -167,23 +211,54 @@ def convert_voice(source_audio_bytes, target_audio_bytes, diffusion_steps=30, le
     os.chdir("/workspace/seed-vc")
     
     full_audio = None
-    for mp3_bytes, audio_result in vc_wrapper_v2.convert_voice_with_streaming(
-        source_audio_path=src_path,
-        target_audio_path=tgt_path,
-        diffusion_steps=min(diffusion_steps, 50),
-        length_adjust=length_adjust,
-        intelligebility_cfg_rate=0.7,
-        similarity_cfg_rate=0.7,
-        top_p=0.7,
-        temperature=0.7,
-        repetition_penalty=1.5,
-        convert_style=convert_style,
-        anonymization_only=False,
-        device=device,
-        dtype=dtype,
-        stream_output=True,
-    ):
-        full_audio = audio_result
+    
+    if is_v1:
+        # V1 Mode: Fast, preserves timing - ideal for lip-sync
+        # Hardcoded optimal parameters for V1:
+        # - diffusion_steps: 10 (fast) or 40 (better quality)
+        # - inference_cfg_rate: 0.7
+        # - auto_f0_adjust: True
+        # - pitch_shift: 0
+        for audio_result in vc_wrapper_v1.convert_voice(
+            source_audio_path=src_path,
+            target_audio_path=tgt_path,
+            diffusion_steps=min(diffusion_steps, 200),
+            length_adjust=length_adjust,
+            inference_cfg_rate=inference_cfg_rate,
+            f0_condition=False,
+            auto_f0_adjust=auto_f0_adjust,
+            pitch_shift=pitch_shift,
+            device=device,
+            dtype=dtype,
+        ):
+            full_audio = audio_result
+    else:
+        # V2 Mode: Quality, emphasizes target voice
+        # Hardcoded optimal parameters for V2:
+        # - diffusion_steps: 40
+        # - intelligibility_cfg_rate: 0.5
+        # - similarity_cfg_rate: 0.5
+        # - top_p: 0.9
+        # - temperature: 1.0
+        # - repetition_penalty: 1.0
+        # - convert_style: False (MUST be disabled for best results)
+        for mp3_bytes, audio_result in vc_wrapper_v2.convert_voice_with_streaming(
+            source_audio_path=src_path,
+            target_audio_path=tgt_path,
+            diffusion_steps=min(diffusion_steps, 200),
+            length_adjust=length_adjust,
+            intelligebility_cfg_rate=intelligibility_cfg_rate,
+            similarity_cfg_rate=similarity_cfg_rate,
+            top_p=top_p,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+            convert_style=convert_style,
+            anonymization_only=False,
+            device=device,
+            dtype=dtype,
+            stream_output=True,
+        ):
+            full_audio = audio_result
     
     inference_time = time.time() - inference_start
     
@@ -256,6 +331,7 @@ def convert_voice(source_audio_bytes, target_audio_bytes, diffusion_steps=30, le
 def handler(job):
     """
     Queue-based handler for WaveSpeed/RunPod serverless.
+    Supports both V1 (fast/lip-sync) and V2 (quality) modes.
     
     Input format:
     {
@@ -264,9 +340,22 @@ def handler(job):
             "target_audio": "<base64 encoded audio>",
             "source_is_url": false,  # optional, if true source_audio is a URL
             "target_is_url": false,  # optional, if true target_audio is a URL
-            "diffusion_steps": 30,   # optional
+            "mode": "fast",          # "fast" (V1) or "quality" (V2), default: "fast"
+            "diffusion_steps": null, # optional, auto-set based on mode (10 for fast, 40 for quality)
             "length_adjust": 1.0,    # optional
-            "convert_style": true    # optional
+            
+            # V1 parameters (only used when mode="fast")
+            "inference_cfg_rate": 0.7,  # optional
+            "auto_f0_adjust": true,     # optional
+            "pitch_shift": 0,           # optional
+            
+            # V2 parameters (only used when mode="quality")
+            "intelligibility_cfg_rate": 0.5,  # optional
+            "similarity_cfg_rate": 0.5,       # optional
+            "top_p": 0.9,                     # optional
+            "temperature": 1.0,               # optional
+            "repetition_penalty": 1.0,        # optional
+            "convert_style": false            # optional, MUST be false for best results
         }
     }
     
@@ -275,6 +364,7 @@ def handler(job):
         "audio": "<base64 encoded wav>",
         "sample_rate": 22050,
         "duration_s": 8.5,
+        "mode": "fast",
         "metrics": { ... }
     }
     """
@@ -310,17 +400,43 @@ def handler(job):
         else:
             target_bytes = base64.b64decode(target_audio)
         
-        # Get optional parameters
-        diffusion_steps = job_input.get("diffusion_steps", 30)
+        # Get mode (default: fast/V1 for lip-sync)
+        mode = job_input.get("mode", "fast")
+        
+        # Get common parameters
+        diffusion_steps = job_input.get("diffusion_steps", None)  # Auto-set based on mode
         length_adjust = job_input.get("length_adjust", 1.0)
-        convert_style = job_input.get("convert_style", True)
+        
+        # Get V1 parameters (used when mode="fast")
+        inference_cfg_rate = job_input.get("inference_cfg_rate", 0.7)
+        auto_f0_adjust = job_input.get("auto_f0_adjust", True)
+        pitch_shift = job_input.get("pitch_shift", 0)
+        
+        # Get V2 parameters (used when mode="quality")
+        intelligibility_cfg_rate = job_input.get("intelligibility_cfg_rate", 0.5)
+        similarity_cfg_rate = job_input.get("similarity_cfg_rate", 0.5)
+        top_p = job_input.get("top_p", 0.9)
+        temperature = job_input.get("temperature", 1.0)
+        repetition_penalty = job_input.get("repetition_penalty", 1.0)
+        convert_style = job_input.get("convert_style", False)  # MUST be False for best results
         
         # Run conversion
         audio_base64, sample_rate, duration, metrics = convert_voice(
             source_bytes,
             target_bytes,
+            mode=mode,
             diffusion_steps=diffusion_steps,
             length_adjust=length_adjust,
+            # V1 params
+            inference_cfg_rate=inference_cfg_rate,
+            auto_f0_adjust=auto_f0_adjust,
+            pitch_shift=pitch_shift,
+            # V2 params
+            intelligibility_cfg_rate=intelligibility_cfg_rate,
+            similarity_cfg_rate=similarity_cfg_rate,
+            top_p=top_p,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
             convert_style=convert_style,
         )
         
@@ -328,6 +444,7 @@ def handler(job):
             "audio": audio_base64,
             "sample_rate": sample_rate,
             "duration_s": duration,
+            "mode": mode,
             "metrics": metrics,
         }
         
