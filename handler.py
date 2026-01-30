@@ -108,20 +108,16 @@ def load_models():
     print(f"💰 Estimated cost: ${gpu_cost:.2f}/hour")
     print("-" * 60)
     
-    from hydra.utils import instantiate
-    from omegaconf import DictConfig
-    
-    # Load V1 models (Fast - Voice & Singing)
+    # Load V1 models (Fast - Voice & Singing) - uses SeedVCWrapper directly
     print("📦 Loading SeedVC V1 models (Fast mode)...")
-    cfg_v1 = DictConfig(yaml.safe_load(open("configs/v1/vc_wrapper.yaml", "r")))
-    vc_wrapper_v1 = instantiate(cfg_v1)
-    vc_wrapper_v1.load_checkpoints()
-    vc_wrapper_v1.to(device)
-    vc_wrapper_v1.eval()
+    from seed_vc_wrapper import SeedVCWrapper
+    vc_wrapper_v1 = SeedVCWrapper(device=device)
     print(f"✅ V1 loaded | GPU Memory: {torch.cuda.memory_allocated(0) / (1024**3):.2f} GB")
     
-    # Load V2 models (Quality - Voice & Style)
+    # Load V2 models (Quality - Voice & Style) - uses hydra config
     print("📦 Loading SeedVC V2 models (Quality mode)...")
+    from hydra.utils import instantiate
+    from omegaconf import DictConfig
     cfg_v2 = DictConfig(yaml.safe_load(open("configs/v2/vc_wrapper.yaml", "r")))
     vc_wrapper_v2 = instantiate(cfg_v2)
     vc_wrapper_v2.load_checkpoints()
@@ -214,22 +210,17 @@ def convert_voice(source_audio_bytes, target_audio_bytes, mode="fast", diffusion
     
     if is_v1:
         # V1 Mode: Fast, preserves timing - ideal for lip-sync
-        # Hardcoded optimal parameters for V1:
-        # - diffusion_steps: 10 (fast) or 40 (better quality)
-        # - inference_cfg_rate: 0.7
-        # - auto_f0_adjust: True
-        # - pitch_shift: 0
-        for audio_result in vc_wrapper_v1.convert_voice(
-            source_audio_path=src_path,
-            target_audio_path=tgt_path,
+        # Uses SeedVCWrapper.convert_voice which yields (mp3_bytes, numpy_audio)
+        for mp3_bytes, audio_result in vc_wrapper_v1.convert_voice(
+            source=src_path,
+            target=tgt_path,
             diffusion_steps=min(diffusion_steps, 200),
             length_adjust=length_adjust,
             inference_cfg_rate=inference_cfg_rate,
             f0_condition=False,
             auto_f0_adjust=auto_f0_adjust,
             pitch_shift=pitch_shift,
-            device=device,
-            dtype=dtype,
+            stream_output=True,
         ):
             full_audio = audio_result
     else:
